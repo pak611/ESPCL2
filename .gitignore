@@ -1,0 +1,61 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+env/
+ENV/
+*.egg-info/
+dist/
+build/
+
+# Data files
+data/
+*.pt
+*.pth
+*.csv
+*.h5
+*.hdf5
+
+# Results and outputs
+results/
+paper_figures/
+dataset_viz/
+dataset_viz_cropped/
+pair_visualizations/
+*.png
+*.jpg
+*.jpeg
+*.pdf
+*.svg
+
+# Logs
+*.log
+logs/
+wandb/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb
+
+# Model checkpoints (keep training scripts, not trained models)
+checkpoints/
+*.ckpt
+
+# Temporary files
+tmp/
+temp/
+*.tmp
