@@ -1,119 +1,211 @@
-"""Test cross-dataset generalization: BindingDB → DAVIS"""
+"""
+Test ESPCL2 generalization on Davis dataset.
+
+Evaluates a model trained on PDBbind by testing on Davis protein-ligand pairs.
+"""
 
 import torch
+import sys
+import pandas as pd
 import numpy as np
 from pathlib import Path
-from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
-from scipy.stats import pearsonr
 from tqdm import tqdm
+import argparse
 
-from models.esp_jointnet import ESP_JointNet
-from utils.dataset import ESPPairDataset
+# Add ESPCL2 to path
+sys.path.insert(0, '/home/patrick/Desktop/ESPCL2')
 
-def evaluate_on_davis(checkpoint_path, davis_path, max_samples=None):
-    device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    print(f"Using device: {device}\n")
+from models import ESP_JointNet
+from utils.metrics import compute_recall_metrics, compute_auroc_bedroc, compute_similarity_stats
+
+
+def load_model(checkpoint_path, device='cuda'):
+    """Load trained ESPCL2 model."""
+    print(f"Loading model from {checkpoint_path}...")
     
-    # Load DAVIS dataset
-    print(f"Loading DAVIS dataset from {davis_path}")
-    davis_dataset = ESPPairDataset(davis_path)
-    
-    if max_samples:
-        davis_dataset = torch.utils.data.Subset(davis_dataset, list(range(max_samples)))
-        print(f"Limited to {max_samples} samples")
-    
-    davis_loader = torch.utils.data.DataLoader(
-        davis_dataset, batch_size=32, shuffle=False, num_workers=4
+    # Initialize model
+    model = ESP_JointNet(
+        embedding_dim=256,
+        dropout=0.3,
+        pocket_channels=8,
+        ligand_channels=8
     )
     
     # Load checkpoint
-    print(f"\nLoading checkpoint from {checkpoint_path}")
-    checkpoint = torch.load(checkpoint_path, map_location=device)
+    checkpoint = torch.load(checkpoint_path, weights_only=False, map_location=device)
     
-    # Create model with cross-attention
-    model = ESP_JointNet(
-        pocket_channels=10,
-        ligand_channels=9,
-        embedding_dim=256,
-        use_cross_attention=True
-    ).to(device)
-    
-    # Remove 'module.' prefix from DataParallel
+    # Handle DataParallel
     state_dict = checkpoint['model_state_dict']
-    state_dict = {k.replace('module.', ''): v for k, v in state_dict.items()}
+    if list(state_dict.keys())[0].startswith('module.'):
+        state_dict = {k.replace('module.', ''): v for k, v in state_dict.items()}
+    
     model.load_state_dict(state_dict)
-    
-    print(f"Loaded model from epoch {checkpoint.get('epoch', '?')}")
-    print(f"Training loss: {checkpoint.get('train_loss', '?'):.4f}")
-    print(f"Validation loss: {checkpoint.get('val_loss', '?'):.4f}\n")
-    
-    # Evaluate
+    model = model.to(device)
     model.eval()
-    all_preds = []
-    all_labels = []
     
-    print("Evaluating on DAVIS...")
-    with torch.no_grad():
-        for batch in tqdm(davis_loader):
-            pocket = batch['pocket_esp'].to(device)
-            ligand = batch['ligand_esp'].to(device)
-            labels = batch['label'].to(device)
-            
-            # Forward pass (returns predictions, z_pocket, z_ligand, mask_info)
-            predictions, _, _, _ = model(pocket, ligand)
-            
-            all_preds.append(predictions.cpu().numpy())
-            all_labels.append(labels.cpu().numpy())
-    
-    # Concatenate results
-    all_preds = np.concatenate(all_preds).flatten()
-    all_labels = np.concatenate(all_labels).flatten()
-    
-    # Compute metrics
-    mse = mean_squared_error(all_labels, all_preds)
-    rmse = np.sqrt(mse)
-    mae = mean_absolute_error(all_labels, all_preds)
-    r2 = r2_score(all_labels, all_preds)
-    pearson_r, pearson_p = pearsonr(all_labels, all_preds)
-    
-    print("\n" + "="*70)
-    print("CROSS-DATASET GENERALIZATION: BindingDB → DAVIS")
-    print("="*70)
-    print(f"Samples: {len(all_labels)}")
-    print(f"\nMSE:       {mse:.4f}")
-    print(f"RMSE:      {rmse:.4f}")
-    print(f"MAE:       {mae:.4f}")
-    print(f"R²:        {r2:.4f}")
-    print(f"Pearson r: {pearson_r:.4f} (p={pearson_p:.2e})")
-    print(f"\nLabel statistics:")
-    print(f"  Mean: {all_labels.mean():.4f}")
-    print(f"  Std:  {all_labels.std():.4f}")
-    print(f"  Range: [{all_labels.min():.4f}, {all_labels.max():.4f}]")
-    print(f"\nPrediction statistics:")
-    print(f"  Mean: {all_preds.mean():.4f}")
-    print(f"  Std:  {all_preds.std():.4f}")
-    print(f"  Range: [{all_preds.min():.4f}, {all_preds.max():.4f}]")
-    print("="*70)
-    
-    # Show some examples
-    print("\nExample predictions (first 10):")
-    print("True Label | Prediction | Error")
-    print("-" * 40)
-    for i in range(min(10, len(all_labels))):
-        error = all_preds[i] - all_labels[i]
-        print(f"{all_labels[i]:10.4f} | {all_preds[i]:10.4f} | {error:+.4f}")
+    print("Model loaded successfully")
+    return model
 
-if __name__ == '__main__':
-    import argparse
+
+def evaluate_on_dataset(model, dataset_path, device='cuda', batch_size=100, save_embeddings=False):
+    """Evaluate model on a dataset."""
+    print(f"\nLoading dataset from {dataset_path}...")
     
-    parser = argparse.ArgumentParser(description='Test cross-dataset generalization')
-    parser.add_argument('--checkpoint', type=str, default='results/run_20260109_123001/best_model.pt',
-                        help='Path to model checkpoint')
-    parser.add_argument('--davis-data', type=str, default='data/davis/davis_voxelized.pt',
-                        help='Path to DAVIS dataset')
-    parser.add_argument('--max-samples', type=int, default=None,
-                        help='Maximum number of samples to test on')
+    # Load dataset
+    data = torch.load(dataset_path, weights_only=False, map_location='cpu')
+    
+    voxels = data['voxels']
+    labels = data['labels']
+    pdb_codes = data.get('pdb_codes', data.get('sample_ids', None))
+    
+    n_samples = len(voxels)
+    n_channels = voxels.shape[1]
+    channels_per_mol = n_channels // 2
+    
+    print(f"Dataset: {n_samples} samples, {n_channels} channels ({channels_per_mol} per molecule)")
+    
+    # Split into ligand and pocket
+    ligand_voxels = voxels[:, :channels_per_mol]
+    pocket_voxels = voxels[:, channels_per_mol:]
+    
+    # Compute embeddings in batches
+    pocket_embeddings = []
+    ligand_embeddings = []
+    
+    model.eval()
+    with torch.no_grad():
+        for i in tqdm(range(0, n_samples, batch_size), desc="Computing embeddings"):
+            batch_end = min(i + batch_size, n_samples)
+            
+            pocket_batch = pocket_voxels[i:batch_end].to(device)
+            ligand_batch = ligand_voxels[i:batch_end].to(device)
+            
+            z_pocket, z_ligand, _ = model(pocket_batch, ligand_batch)
+            
+            pocket_embeddings.append(z_pocket.cpu())
+            ligand_embeddings.append(z_ligand.cpu())
+    
+    # Concatenate
+    pocket_embeddings = torch.cat(pocket_embeddings, dim=0)
+    ligand_embeddings = torch.cat(ligand_embeddings, dim=0)
+    
+    print(f"Embeddings shape: {pocket_embeddings.shape}")
+    
+    # Compute similarity matrix
+    print("Computing similarity matrix...")
+    similarity_matrix = torch.matmul(pocket_embeddings, ligand_embeddings.T)
+    
+    print(f"Similarity range: [{similarity_matrix.min():.3f}, {similarity_matrix.max():.3f}]")
+    
+    # Compute metrics (use scaled logits for proper AUROC)
+    print("\nComputing metrics...")
+    B = similarity_matrix.shape[0]
+    labels_idx = torch.arange(B)
+    
+    # Scale by temperature (same as training)
+    temperature = 0.07
+    logits = similarity_matrix / temperature
+    
+    recall_metrics = compute_recall_metrics(logits, labels_idx, B)
+    auroc_metrics = compute_auroc_bedroc(logits)
+    sim_stats = compute_similarity_stats(similarity_matrix)
+    
+    # Combine all metrics
+    all_metrics = {**recall_metrics, **auroc_metrics, **sim_stats}
+    
+    if save_embeddings:
+        return all_metrics, similarity_matrix, pdb_codes, pocket_embeddings, ligand_embeddings
+    else:
+        return all_metrics, similarity_matrix, pdb_codes
+
+
+def print_results(metrics, dataset_name):
+    """Print evaluation results."""
+    print(f"\n{'='*80}")
+    print(f"{dataset_name} Results (Zero-shot Generalization)")
+    print('='*80)
+    
+    print(f"\nRecall Metrics:")
+    print(f"  Pocket→Ligand:")
+    print(f"    Recall@1%:  {metrics['recall1pct_p2l']*100:.2f}%")
+    print(f"    Recall@5%:  {metrics['recall5pct_p2l']*100:.2f}%")
+    print(f"    Recall@10%: {metrics['recall10pct_p2l']*100:.2f}%")
+    print(f"  Ligand→Pocket:")
+    print(f"    Recall@1%:  {metrics['recall1pct_l2p']*100:.2f}%")
+    print(f"    Recall@5%:  {metrics['recall5pct_l2p']*100:.2f}%")
+    print(f"    Recall@10%: {metrics['recall10pct_l2p']*100:.2f}%")
+    
+    print(f"\nEnrichment Factors:")
+    print(f"  EF@1%:  P→L {metrics['ef1_p2l']:.1f}, L→P {metrics['ef1_l2p']:.1f}")
+    print(f"  EF@5%:  P→L {metrics['ef5_p2l']:.1f}, L→P {metrics['ef5_l2p']:.1f}")
+    print(f"  EF@10%: P→L {metrics['ef10_p2l']:.1f}, L→P {metrics['ef10_l2p']:.1f}")
+    
+    print(f"\nRanking Quality:")
+    print(f"  AUROC: P→L {metrics['auroc_p2l']:.4f}, L→P {metrics['auroc_l2p']:.4f}")
+    print(f"  BEDROC: P→L {metrics['bedroc_p2l']:.4f}, L→P {metrics['bedroc_l2p']:.4f}")
+    
+    if 'pos_similarity' in metrics:
+        print(f"\nSimilarity Statistics:")
+        print(f"  Positive pairs: {metrics['pos_similarity']:.3f}")
+        print(f"  Negative pairs: {metrics['neg_similarity']:.3f}")
+        print(f"  Separation: {metrics['separation']:.3f}")
+
+
+def main():
+    parser = argparse.ArgumentParser(description='Test ESPCL2 generalization on Davis dataset')
+    parser.add_argument('--checkpoint', type=str, required=True, help='Path to trained model checkpoint')
+    parser.add_argument('--davis_dataset', type=str, default='/data/davis_field_based_v4.pt', help='Path to Davis dataset (.pt)')
+    parser.add_argument('--output_dir', type=str, default='davis_evaluation', help='Output directory')
+    parser.add_argument('--batch_size', type=int, default=100, help='Batch size for inference')
+    parser.add_argument('--device', type=str, default='cuda', help='Device (cuda/cpu)')
+    parser.add_argument('--save_embeddings', action='store_true', help='Save embeddings for visualization')
     
     args = parser.parse_args()
     
-    evaluate_on_davis(args.checkpoint, args.davis_data, max_samples=args.max_samples)
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    
+    # Load model (trained on PDBbind)
+    model = load_model(args.checkpoint, args.device)
+    
+    # Evaluate on Davis
+    results = evaluate_on_dataset(
+        model, args.davis_dataset, args.device, args.batch_size, 
+        save_embeddings=args.save_embeddings
+    )
+    
+    if args.save_embeddings:
+        davis_metrics, davis_similarity, davis_codes, pocket_embeds, ligand_embeds = results
+    else:
+        davis_metrics, davis_similarity, davis_codes = results
+    
+    # Print results
+    print_results(davis_metrics, "Davis Dataset")
+    
+    # Save results (similarity matrix is too large for standard pickle)
+    results_file = output_dir / 'davis_generalization_results.pt'
+    save_dict = {
+        'metrics': davis_metrics,
+        'pdb_codes': davis_codes
+    }
+    
+    if args.save_embeddings:
+        save_dict['pocket_embeddings'] = pocket_embeds
+        save_dict['ligand_embeddings'] = ligand_embeds
+        print(f"\nSaving embeddings (shape: {pocket_embeds.shape})...")
+    
+    torch.save(save_dict, results_file, pickle_protocol=4)
+    
+    print(f"\nResults saved to {results_file}")
+    
+    # Save metrics to CSV
+    metrics_df = pd.DataFrame([davis_metrics])
+    metrics_df.to_csv(output_dir / 'davis_metrics.csv', index=False)
+    
+    print(f"Metrics saved to {output_dir / 'davis_metrics.csv'}")
+    
+    print("\n" + "="*80)
+
+
+if __name__ == '__main__':
+    main()

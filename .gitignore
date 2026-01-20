@@ -25,6 +25,13 @@ paper_figures/
 dataset_viz/
 dataset_viz_cropped/
 pair_visualizations/
+voxel_viz*/
+evaluation_*/
+davis_evaluation/
+bindingdb_evaluation/
+pdbbind_evaluation/
+dude_evaluation*/
+davis_generalization*/
 *.png
 *.jpg
 *.jpeg
@@ -33,6 +40,7 @@ pair_visualizations/
 
 # Logs
 *.log
+training_logs/
 logs/
 wandb/
 
@@ -53,6 +61,7 @@ Thumbs.db
 
 # Model checkpoints (keep training scripts, not trained models)
 checkpoints/
+checkpoints_*/
 *.ckpt
 
 # Temporary files
